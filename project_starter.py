@@ -1,3 +1,5 @@
+import json
+
 import pandas as pd
 import numpy as np
 import os
@@ -8,6 +10,12 @@ from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
 from sqlalchemy import create_engine, Engine
+from dataclasses import dataclass, asdict, field
+from smolagents import (
+    ToolCallingAgent,
+    OpenAIServerModel,
+    tool,
+)
 
 # Create an SQLite database
 db_engine = create_engine("sqlite:///munder_difflin.db")
@@ -357,7 +365,7 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
                 ELSE 0
             END), 0) AS current_stock
         FROM transactions
-        WHERE item_name = :item_name
+        WHERE LOWER(item_name) = :item_name
         AND transaction_date <= :as_of_date
     """
 
@@ -365,7 +373,7 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
     return pd.read_sql(
         stock_query,
         db_engine,
-        params={"item_name": item_name, "as_of_date": as_of_date},
+        params={"item_name": item_name.lower(), "as_of_date": as_of_date},
     )
 
 def get_supplier_delivery_date(input_date_str: str, quantity: int) -> str:
@@ -580,40 +588,650 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
         result = conn.execute(text(query), params)
         return [dict(row._mapping) for row in result]
 
-########################
-########################
-########################
-# YOUR MULTI AGENT STARTS HERE
-########################
-########################
-########################
-
-
 # Set up and load your env parameters and instantiate your model.
+dotenv.load_dotenv(dotenv_path=".env")
+openai_api_key = os.getenv("OPENAI_API_KEY")
+model = OpenAIServerModel(
+    model_id="gpt-5-mini",
+    api_key=openai_api_key,
+)
 
 
-"""Set up tools for your agents to use, these should be methods that combine the database functions above
- and apply criteria to them to ensure that the flow of the system is correct."""
+# Initialize running state
+@dataclass
+class ItemOrder:
+    item_name: str
+    requested_quantity: int
+    supplier_price_per_unit: float = 0.0
+    retail_price_per_unit: float = 0.0
+    current_stock: int = 0
+    min_stock_level: int = 0
+    stock_order_needed: int = 0
+    estimated_delivery_date: str = "Immediate"
+    is_stock_ordered: bool = False
+    is_fulfilled: bool = False
 
+@dataclass
+class OrderRunningState:
+    requested_items: List[ItemOrder] = field(default_factory=list)
+    as_of_date: str = ""
+    cash_balance: float = 0.0
+    inventory_value: float = 0.0
+    total_assets: float = 0.0
+    customer_job: str = ""
+    need_size: str = ""
+    event: str = ""
+    initial_request: str = ""
+
+    def reset(self):
+        self.requested_items.clear()
+        self.as_of_date = ""
+        self.cash_balance = 0.0
+        self.inventory_value = 0.0
+        self.total_assets = 0.0
+        self.customer_job = ""
+        self.need_size = ""
+        self.event = ""
+
+order_running_state = OrderRunningState()
 
 # Tools for inventory agent
 
+def get_minimum_stock_level(item_name: str) -> int:
+    """
+    Retrieves the minimum stock level for a given item.
+
+    Args:
+        item_name (str): The name of the item to check.
+
+    Returns:
+        int: The minimum stock level for the specified item.
+    """
+    item_name = item_name.lower()
+    
+    # Query the inventory table for the minimum stock level of the specified item
+    query = "SELECT min_stock_level FROM inventory WHERE LOWER(item_name) = :item_name"
+    result = pd.read_sql(query, db_engine, params={"item_name": item_name})
+
+    if not result.empty:
+        return int(result.iloc[0]["min_stock_level"])
+    else:
+        return 0  # Return 0 if the item is not found in the inventory
+
+
+@tool
+def get_item_stocks() -> Dict[str, Union[Dict[str, Union[int, str, bool]], str]]:
+    """
+    Retrieves the available stock levels for a list of requested items for the current order.
+
+    Returns:
+        Dict[str, Union[Dict[str, Union[int, str, bool]], str]]: A dictionary information for each item.
+
+    Example:
+        >> get_item_stocks()
+        {
+            "A4 paper": {"current_stock": 500, "min_stock_level": 100, "requested_quantity": 450, "stock_order_needed": 250, "estimated_delivery_date": "2025-01-05"},
+            "Letter-sized paper": {"current_stock": 300, "min_stock_level": 80, "requested_quantity": 250, "stock_order_needed": 190, "estimated_delivery_date": "2025-01-02"},
+        }
+    """
+    result = {"available_items": []}
+
+    # Get all requested items from the running state
+    requested_items = order_running_state.requested_items
+    as_of_date = order_running_state.as_of_date
+    inventory_snapshot = get_all_inventory(as_of_date)
+    inventory_item_names = {item_name.lower() for item_name in inventory_snapshot.keys()}
+    valid_item_names = {item["item_name"].lower() for item in paper_supplies}.union(inventory_item_names)
+
+    for item in requested_items:
+        if not isinstance(item, ItemOrder):
+            print(f"WARN: Invalid item in requested_items: {item}. Skipping.")
+            continue
+
+        item_name = item.item_name.lower()
+        if item_name not in valid_item_names:
+            print(f"WARN: Item '{item_name}' not found in valid item names. Skipping.")
+            continue
+
+        requested_quantity = item.requested_quantity
+        current_stock = get_stock_level(item_name, as_of_date)["current_stock"].iloc[0]
+        item.current_stock = int(current_stock)
+        min_stock_level = get_minimum_stock_level(item_name)
+        item.min_stock_level = int(min_stock_level)
+
+        # Calculate if a stock order is needed, accounting for the minimum stock level
+        stock_order_needed = max(0, requested_quantity - current_stock + min_stock_level)
+        item.stock_order_needed = int(stock_order_needed)
+
+        # Get estimated delivery date based on stock order needed
+        estimated_delivery_date = get_supplier_delivery_date(as_of_date, stock_order_needed) if stock_order_needed > 0 else "Immediate"
+        item.estimated_delivery_date = estimated_delivery_date
+
+        result['available_items'].append({
+            "item_name": item_name,
+            "current_stock": int(current_stock),
+            "min_stock_level": int(min_stock_level),
+            "requested_quantity": int(requested_quantity),
+            "stock_order_needed": int(stock_order_needed),
+            "estimated_delivery_date": estimated_delivery_date,
+        })
+
+    if not result.get('available_items'):
+        return {"message": "No available items for the requested order."}
+
+    return result
+
+@tool
+def get_inventory_snapshot(as_of_date: str) -> List[Dict[str, Union[str, int, float]]]:
+    """
+    Retrieve a snapshot of the inventory as of a specific date.
+
+    Args:
+        as_of_date (str): The date (inclusive) for which to retrieve the inventory snapshot in ISO format.
+
+    Returns:
+        List[Dict[str, Union[str, int, float]]]: A list of dictionaries representing each item in the inventory,
+        including item name, category, unit price, current stock, and minimum stock level.
+
+    Raises:
+        ValueError: If no inventory snapshot is found for the specified date.
+    """
+    # Query the inventory table for all items
+    financial_report = generate_financial_report(as_of_date)
+    inventory_snapshot = financial_report.get("inventory_summary", [])
+
+    if not inventory_snapshot:
+        raise ValueError(f"No inventory snapshot found for the date: {as_of_date}")
+    else:
+        return inventory_snapshot
 
 # Tools for quoting agent
+@tool
+def get_ordered_items_prices() -> Dict[str, float]:
+    """
+    Retrieve the unit prices for requested items with a profit margin of 20% applied.
+
+    Returns:
+        Dict[str, float]: A dictionary mapping item names to their unit prices.
+    """
+    prices_with_margin = {}
+
+    for item in order_running_state.requested_items:
+        if not isinstance(item, ItemOrder):
+            print(f"WARN: Invalid item in requested_items: {item}. Skipping.")
+            continue
+
+        prices_with_margin[item.item_name] = item.retail_price_per_unit
+
+    if not prices_with_margin:
+        return {"message": "No available items for the requested order."}
+
+    return prices_with_margin
+
+@tool
+def search_quote_history_based_on_order() -> List[Dict]:
+    """
+    Retrieve a list of historical quotes that match any of the provided order information.
+
+    The function searches both the original customer request (from `quote_requests`) and
+    the response quote (from `quotes`) for each item-name in the order-request.
+
+    Returns:
+        List[Dict]: A list of matching quotes, each represented as a dictionary with fields:
+            - original_request
+            - total_amount
+            - quote_explanation
+            - job_type
+            - order_size
+            - event_type
+            - order_date
+        
+    Example:
+        >> search_quote_history_based_on_order(limit=3)
+        [
+            {
+                "original_request": "Customer requested A4 paper and Banner paper for an event.",
+                "total_amount": 150.00,
+                "quote_explanation": "Based on previous orders, we can offer a discount for bulk purchase.",
+                "job_type": "Event",
+                "order_size": "Large",
+                "event_type": "Corporate",
+                "order_date": "2025-01-10"
+            },
+            ...
+    """
+    # Extract item names from the order information
+    order_info = order_running_state.requested_items
+    search_terms = [item.item_name for item in order_info if isinstance(item, ItemOrder) and item.item_name]
+
+    # Use the existing search_quote_history function to find matching quotes
+    result = search_quote_history(search_terms)
+    if not result:
+        result = [{"message": "No matching quotes found for the requested items."}]
+
+    return result
 
 
 # Tools for ordering agent
 
+@tool
+def process_all_orders() -> Dict[str, Union[float, List[Dict[str, Union[str, int, float]]]]]:
+    """
+    Process the orders for all requested items, placing stock orders if needed and finalizing sales transactions.
+
+    Returns:
+        Dict[str, Union[float, List[Dict[str, Union[str, int, float]]]]]: A dictionary containing the total sales amount,
+        total stock order amount, and a list of processed orders.
+        The processed orders list includes dictionaries with keys: item_name, quantity_ordered, price_per_unit, total_price, date, and transaction_type.
+
+    Raises:
+        ValueError: If an error occurs during order processing.
+    """
+    stock_orders = []
+    sales_transactions = []
+    as_of_date = order_running_state.as_of_date
+    total_sales_amount = 0.0
+    total_stock_order_amount = 0.0
+
+    for item in order_running_state.requested_items:
+        if not isinstance(item, ItemOrder):
+            print(f"WARN: Invalid item in requested_items: {item}. Skipping.")
+            continue
+
+        # Place stock order if needed
+        if item.stock_order_needed > 0 and not item.is_stock_ordered:
+            try:
+                transaction_id = create_transaction(
+                    item_name=item.item_name,
+                    transaction_type="stock_orders",
+                    quantity=item.stock_order_needed,
+                    price=item.stock_order_needed * item.supplier_price_per_unit,
+                    date=as_of_date
+                )
+                item.is_stock_ordered = True
+                total_stock_order_amount += item.stock_order_needed * item.supplier_price_per_unit
+                print(f"Stock order placed for {item.item_name}: {item.stock_order_needed} units (Transaction ID: {transaction_id})")
+            except Exception as e:
+                raise ValueError(f"Failed to place stock order for {item.item_name}: {e}")
+            
+            stock_orders.append({
+                "item_name": item.item_name,
+                "quantity_ordered": item.stock_order_needed,
+                "price_per_unit": item.supplier_price_per_unit,
+                "total_price": item.stock_order_needed * item.supplier_price_per_unit,
+                "transaction_type": "stock_orders",
+                "date": as_of_date
+            })
+
+        # Finalize sales transaction
+        try:
+            transaction_id = create_transaction(
+                item_name=item.item_name,
+                transaction_type="sales",
+                quantity=item.requested_quantity,
+                price=item.requested_quantity * item.retail_price_per_unit,
+                date=as_of_date
+            )
+            item.is_fulfilled = True
+            total_sales_amount += item.requested_quantity * item.retail_price_per_unit
+            print(f"Sales transaction completed for {item.item_name}: {item.requested_quantity} units (Transaction ID: {transaction_id})")
+        except Exception as e:
+            raise ValueError(f"Failed to finalize sales transaction for {item.item_name}: {e}")
+
+        sales_transactions.append({
+            "item_name": item.item_name,
+            "quantity_ordered": item.requested_quantity,
+            "price_per_unit": item.retail_price_per_unit,
+            "total_price": item.requested_quantity * item.retail_price_per_unit,
+            "transaction_type": "sales",
+            "date": as_of_date
+        })
+
+    result = {
+        "total_sales_amount": round(total_sales_amount, 2),
+        "total_stock_order_amount": round(total_stock_order_amount, 2),
+        "stock_orders": stock_orders,
+        "sales_transactions": sales_transactions
+    }
+
+    return result
+
+@tool
+def get_cash_balance_as_of_date(as_of_date: str) -> float:
+    """
+    Retrieve the current cash balance as of a specific date.
+
+    Args:
+        as_of_date (str): The date (inclusive) for which to retrieve the cash balance in ISO format.
+
+    Returns:
+        float: The current cash balance as of the specified date.
+    """
+    return get_cash_balance(as_of_date)
+
 
 # Set up your agents and create an orchestration agent that will manage them.
 
+class CustomerRequestAgent(ToolCallingAgent):
+    """
+    Agent responsible for parsing customer requests and extracting structured order information.
+    """
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            tools=[],
+            model=model,
+            name="customer_request_agent",
+            description="Agent that parses customer requests and extracts structured order information."
+        )
+
+class InventoryManagementAgent(ToolCallingAgent):
+    """
+    Agent responsible for checking inventory levels, determining if items are
+    in stock, determining stock replenishment orders, and estimating delivery times.
+    """
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            tools=[get_item_stocks, get_inventory_snapshot],
+            model=model,
+            name="inventory_management_agent",
+            description="Agent that manages inventory levels and determines if stock orders are needed to fulfill customer requests."
+        )
+
+
+class QuotingAgent(ToolCallingAgent):
+    """
+    Agent responsible for generating quotes based on customer requests and 
+    historical quote data, ensuring that quotes are persuasive, competitive,
+    and profitable.
+    """
+
+    def __init__(self, model: OpenAIServerModel):
+        super().__init__(
+            tools=[search_quote_history_based_on_order, get_ordered_items_prices],
+            model=model,
+            name="quoting_agent",
+            description="Agent that generates quotes based on customer requests and historical data."
+        )
+
+
+class OrderingAgent(ToolCallingAgent):
+    """
+    Agent responsible for placing orders to suppliers and finalizing sales 
+    transactions, ensuring timely delivery and accurate record-keeping.
+    """
+
+    def __init__(self, model:OpenAIServerModel):
+        super().__init__(
+            tools=[process_all_orders, get_cash_balance_as_of_date],
+            model=model,
+            name="ordering_agent",
+            description="Agent that places orders to suppliers and finalizes sales transactions."
+        )
+
+
+class OrchestrationAgent(ToolCallingAgent):
+    """
+    Orchestration agent that coordinates the activities of the customer-request,
+    inventory-management, quoting, and ordering agents to handle customer requests.
+    """
+
+    def __init__(self, model: OpenAIServerModel):
+        self.customer_request_agent = CustomerRequestAgent(model)
+        self.inventory_management_agent = InventoryManagementAgent(model)
+        self.quoting_agent = QuotingAgent(model)
+        self.ordering_agent = OrderingAgent(model)
+
+        @tool
+        def process_initial_request() -> str:
+            """
+            Parse the initial customer request to extract structured order information.
+            You are not able to ask confirmations to customers.
+
+            Returns:
+                str: A structured summary of the parsed order information.
+
+            Raises:
+                ValueError: If the response from the customer request agent cannot be parsed as valid JSON.
+            """
+            canon_item_names = [{"item_name": item["item_name"], "price_per_unit": item.get("unit_price", 0.0)} for item in paper_supplies]
+            input = f"""
+            # Role & Task
+            You are a customer-request parsing agent.
+            Your task is to parse the customer request and extract structured order information.
+            The requested item-names must be replaced with the canon item-names from the list below.
+
+            # Suggested Workflow
+            1. Map the requested item names to the canon item-names from the list below, ensuring that the downstream agents can recognize them. 
+            2. If an item cannot be mapped to the list, you must put it in the "unavailable_items" list.
+            3. Format the extracted information into a structured summary.
+
+            # Output Format in JSON
+            {{
+                "requested_items": [
+                    {{
+                        "item_name" (str): <Canon Item Name>,
+                        "quantity" (int): <Quantity>
+                        "supplier_price_per_unit" (float): <Supplier Price Per Unit>
+                    }},
+                    ...
+                ]
+                "unavailable_items": ["<Item Name>", ...],
+                "request_date" (str): <Request Date in ISO format (YYYY-MM-DD)>
+            }}
+
+            # Customer Order
+            {order_running_state.initial_request}
+            Request Date: {order_running_state.as_of_date}
+
+            # Canon Item Names
+            {canon_item_names}
+            """
+            response = self.customer_request_agent.run(input)
+            canon_item_names_lower = {item["item_name"].lower() for item in canon_item_names}
+
+            try:
+                # Attempt to parse the response as JSON
+                parsed_response = json.loads(response)
+                for item_order in parsed_response.get("requested_items", []):
+                    item_name = item_order.get("item_name", "")
+
+                    if item_name.lower() not in canon_item_names_lower or not item_name:
+                        print(f"WARN: Item '{item_name}' not found in canon item names. Skipping.")
+                        continue  # Skip items not in the canon list
+
+                    quantity = item_order.get("quantity", 0)
+
+                    # Get price per unit from the parsed item, otherwise get from paper_supplies
+                    if "supplier_price_per_unit" not in item_order:
+                        # Look up price from paper_supplies if not provided in the order
+                        supplier_price_per_unit = next((item["unit_price"] for item in paper_supplies if item["item_name"].lower() == item_name.lower()), 0.0)
+                    elif "supplier_price_per_unit" in item_order:
+                        supplier_price_per_unit = item_order.get("supplier_price_per_unit")
+                    else:
+                        continue  # Skip if supplier_price_per_unit is not provided and cannot be found
+
+                    # Add 20% profit margin to the price per unit
+                    retail_price_per_unit = supplier_price_per_unit * 1.2
+                    retail_price_per_unit = round(retail_price_per_unit, 2)  # Round to 2 decimal places
+                    supplier_price_per_unit = round(supplier_price_per_unit, 2)  # Round to 2 decimal places
+
+                    if item_name and quantity > 0:
+                        order_running_state.requested_items.append(
+                            ItemOrder(item_name=item_name, requested_quantity=quantity, supplier_price_per_unit=supplier_price_per_unit, retail_price_per_unit=retail_price_per_unit)
+                        )
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse JSON response from process_customer_order: {response}. Error: {e}")
+            
+            order = asdict(order_running_state)
+            result = {"requested_items": [], "request_date": order_running_state.as_of_date, "unavailable_items": parsed_response.get("unavailable_items", [])}
+            for item in order["requested_items"]:
+                result["requested_items"].append({
+                    "item_name": item['item_name'],
+                    "quantity": item['requested_quantity'],
+                    "retail_price_per_unit": item['retail_price_per_unit'],
+                })
+
+            return result
+        
+        @tool
+        def process_inventory_check() -> str:
+            """
+            Check inventory availability and levels based on the parsed order information and determine if stock replenishment is needed.
+
+            Returns:
+                str: A structured summary of the inventory check results.
+            """
+            # Use the inventory management agent to check inventory
+            ordered_items = asdict(order_running_state)["requested_items"]
+            ordered_items_info = [{"item_name": item["item_name"], "requested_quantity": item["requested_quantity"]} for item in ordered_items]
+            input = f"""
+            # Role & Task
+            You are an inventory management agent.
+            Your task is to check inventory availability and levels, and to determine if stock replenishment is needed based on the parsed order information.
+            Do not call get_inventory_snapshot for order processing, as it is not needed.
+
+            # Workflow for Order Processing
+            1. Call get_item_stocks to check requested item stocks.
+            2. Based on the output of get_item_stocks, determine if any stock replenishment is needed.
+            3. Based on the output of get_item_stocks, provide an estimated delivery date for any stock replenishment needed.
+            4. Do not include any items other than the available ones.
+            5. Format the output into a structured summary.
+
+            # Output Format in JSON
+            [
+                {{
+                    "item_name" (str): The canon item name from the inventory or the requested item name if invalid,
+                    "requested_quantity" (int): The quantity requested by the customer,
+                    "stock_order_needed" (int): The quantity that needs to be ordered from the supplier,
+                    "estimated_delivery_date" (str): The estimated delivery date for the stock order if needed, or "Immediate" if no stock order is needed,
+                }}
+            ]
+
+            # Request Information
+            {ordered_items_info}
+            Request Date: {order_running_state.as_of_date}
+            """
+            response = self.inventory_management_agent.run(input)
+
+            return response
+        
+        
+        @tool
+        def process_quote() -> str:
+            """
+            Generate a quote based on the order information, historical quote data, and supplier prices.
+
+            Returns:
+                str: A structured summary of the generated quote.
+            """
+            ordered_items = asdict(order_running_state)["requested_items"]
+            ordered_items_info = [{"item_name": item["item_name"], "requested_quantity": item["requested_quantity"], "estimated_delivery_date": item.get("estimated_delivery_date", "Immediate")} for item in ordered_items]
+            input = f"""
+            # Role & Task
+            You are a quoting agent of the Munder Difflin Paper Company.
+            Your task is to generate a quote based on the requested order information and historical quote data, if possible.
+            Do not inform the customer about anything to do with the stock's shortages, stock orders, or our profit margin.
+            Do not mention any internal processes or tools used and do not ask for confirmation from the customer.
+
+            # Suggested Workflow
+            1. First, get_ordered_items_prices to retrieve the unit prices for all items in the current order.
+            2. Then, use search_quote_history_based_on_order to find relevant historical quotes that match the order information.
+            3. Based on the historical quotes and the current order information, if any, generate a new quote that is persuasive.
+            4. Write a quote that is similar to the style of the historical quote-explanations, but do not copy them verbatim and no placeholders.
+
+            # Order Information
+            Request Date: {order_running_state.as_of_date}
+            Ordered Items: {ordered_items_info}
+            """
+            response = self.quoting_agent.run(input)
+            order_running_state.quote_text = response  # Store the quote text in the running state
+
+            return response
+        
+        @tool
+        def process_ordering() -> str:
+            """
+            Finalize the order by recording the sales transaction and placing stock orders.
+
+            Returns:
+                str: A structured summary of the ordering process, including any stock orders placed and the sales transaction recorded.
+            """
+            input = f"""
+            # Role & Task
+            You are an ordering agent.
+            Your task is to finalize the requested order by recording the sales transaction and placing stock orders.
+            Do not inform about our cash information. Only say whether the order can be fulfilled or not.
+
+            # Suggested Workflow
+            1. Call process_orders to record the sales transaction and place stock orders for any items that need replenishment.
+            2. Call get_cash_balance_as_of_date to retrieve the current cash balance after processing the orders.
+            3. Calculate if we have sufficient cash to cover the stock orders, if not, return a final answer saying the order cannot be fulfilled due to insufficient cash.
+            4. Format the output into a structured summary of the ordering process.
+
+            # Request Information
+            Request Date: {order_running_state.as_of_date}
+
+            # Output Format in JSON
+            {{
+                "sales_transactions_recorded" (List[str]): A list of items that were successfully recorded as sales transactions,
+                "notes" (str): Whether all orders can be fulfilled, based on our cash balance.
+            }}
+            """
+            response = self.ordering_agent.run(input)
+            return response
+
+        super().__init__(
+            tools=[process_initial_request, process_inventory_check, process_quote, process_ordering],
+            model=model,
+            name="orchestration_agent",
+            description="""
+            # Role & Task
+            You are an orchestration agent for Munder Difflin Paper Company.
+            You coordinate the activities of the customer-request, inventory-management, quoting, and ordering agents to handle customer requests.
+            Do not inform the customer about anything to do with the stock orders, our profit margin, or our cash balance. And do not mention any internal processes or tools used.
+            Assume all stock orders will be fulfilled and delivered on time. Do not follow up on stock orders.
+            Do not call any tools to ask for confirmation from the customer. You are the one who must do that in your final answer.
+            For the final answer, you must use the generated quote text from the quoting-agent as the final answer to the customer with modification about unavailable items, delays, or asking confirmation.
+
+            # Workflow
+            1. Use the `process_initial_request` tool to extract and validate the customer's request information.
+            2. After processing the request, you must use the `process_inventory_check` tool to check the processed request for availability and estimated delivery times.
+            3. After obtaining the availability and delivery times information, you must use the `process_quote` tool to generate a quote.
+            4. After obtaining the quote, you must use the `process_ordering` tool to finalize all orders.
+            5. After finalizing the orders, you must return a final answer to the customer using the `final_answer` tool.
+            """
+        )
+
+    def handle_customer_request(self, customer_job: str, need_size: str, event: str, request: str, request_date: str) -> str:
+        """
+        Handle a customer request through a coordinated multi-agent workflow.
+        """
+        order_running_state.reset()
+        order_running_state.customer_job = customer_job
+        order_running_state.need_size = need_size
+        order_running_state.event = event
+        order_running_state.as_of_date = request_date
+        order_running_state.initial_request = request
+
+        input = f"""
+        # Context
+        Customer Job: {customer_job}
+        Need Size: {need_size}
+        Event: {event}
+        Request: {request}
+        Request Date: {request_date}
+        """
+
+        return self.run(input)
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -624,20 +1242,14 @@ def run_test_scenarios():
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
+    print("Database initialized and test data loaded successfully.")
 
     # Get initial state
     initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
     report = generate_financial_report(initial_date)
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
-
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
+    orchestration_agent = OrchestrationAgent(model)
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -650,17 +1262,13 @@ def run_test_scenarios():
         print(f"Inventory Value: ${current_inventory:.2f}")
 
         # Process request
-        request_with_date = f"{row['request']} (Date of request: {request_date})"
-
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
-
-        # response = call_your_multi_agent_system(request_with_date)
+        response = orchestration_agent.handle_customer_request(
+            customer_job=row["job"],
+            need_size=row["need_size"],
+            event=row["event"],
+            request=row["request"],
+            request_date=request_date
+        )
 
         # Update state
         report = generate_financial_report(request_date)
@@ -675,8 +1283,8 @@ def run_test_scenarios():
             {
                 "request_id": idx + 1,
                 "request_date": request_date,
-                "cash_balance": current_cash,
-                "inventory_value": current_inventory,
+                "cash_balance": round(current_cash, 2),
+                "inventory_value": round(current_inventory, 2),
                 "response": response,
             }
         )
