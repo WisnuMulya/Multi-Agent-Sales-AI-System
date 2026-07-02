@@ -1,7 +1,7 @@
 # Multi-Agent Sales AI-System Project Report
 
 ## Workflow
-[!Agentic Pattern Diagram](./agentic-ai-p4.jpg)
+![Agentic Pattern Diagram](./agentic-ai-p4.jpg)
 
 The system has five agents:
 1. The Orchestrator
